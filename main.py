@@ -2,13 +2,13 @@
 import logging
 import re
 import urllib.parse
-import json
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 import httpx
-from urllib.parse import urljoin, parse_qs
+from urllib.parse import urljoin
 
+# Setup logging
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -16,9 +16,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger()
 
+# Constants
 SOURCE_URL = "https://fishy.streamed.su/"
 COOKIE_URL = "https://fishy.streamed.su/api/event"
-TIMEOUT = 20
+TIMEOUT = 30
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36",
     "Referer": "https://embedstreams.top/",
@@ -33,19 +34,31 @@ HEADERS = {
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "cross-site",
     "Content-Type": "application/json",
-    "X-Requested-With": "XMLHttpRequest"
+    "X-Requested-With": "XMLHttpRequest",
+    "X-Forwarded-For": "127.0.0.1"
 }
 
 SEGMENT_MAP = {}
+CACHED_COOKIES = None
 
 app = FastAPI()
 
+@app.get("/ping")
+async def ping():
+    logger.info("Ping request received")
+    return {"status": "ok"}
+
 async def fetch_cookies():
+    global CACHED_COOKIES
+    if CACHED_COOKIES:
+        logger.debug("Using cached cookies")
+        return CACHED_COOKIES
     logger.debug(f"Fetching cookies from {COOKIE_URL}")
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         try:
             payload = {"event": "pageview"}
             response = await client.post(COOKIE_URL, json=payload, headers=HEADERS)
+            logger.debug(f"Cookie response: {response.status_code}, headers: {response.headers}")
             cookies = response.headers.get("set-cookie")
             if not cookies:
                 logger.error("No cookies received")
@@ -61,8 +74,12 @@ async def fetch_cookies():
             formatted_cookies = "; ".join(
                 f"{key}={cookie_dict.get(key)}" for key in required_cookies if key in cookie_dict
             )
+            if not formatted_cookies:
+                logger.error("No required cookies found")
+                return None
+            CACHED_COOKIES = formatted_cookies
             logger.debug(f"Formatted cookies: {formatted_cookies}")
-            return formatted_cookies if formatted_cookies else None
+            return formatted_cookies
         except httpx.HTTPError as e:
             logger.error(f"Error fetching cookies: {str(e)}")
             return None
@@ -98,6 +115,7 @@ async def fetch_resource(url, cookies, retries=3):
                 logger.debug(f"Fetching (attempt {attempt}): {source_url}")
                 try:
                     response = await client.get(source_url, headers=headers)
+                    response.raise_for_status()
                     content = response.content
                     content_type = response.headers.get("content-type", "application/octet-stream")
                     if source_url.endswith(".ts") or source_url.endswith(".js"):
@@ -105,16 +123,17 @@ async def fetch_resource(url, cookies, retries=3):
                     logger.debug(f"Success: {source_url} - Status: {response.status_code}, Content-Type: {content_type}, Size: {len(content)} bytes")
                     return content, content_type
                 except httpx.HTTPError as e:
-                    logger.error(f"Failed: {source_url} - Status: {e}")
+                    logger.error(f"Failed: {source_url} - Error: {str(e)}")
                     if attempt == retries:
                         break
         logger.error(f"All attempts failed for {url}")
         return None
 
 @app.get("/playlist.m3u8")
-async def get_playlist(url: str, cookies: str):
-    logger.debug(f"Request for playlist with url: {url}, cookies: {cookies}")
+async def get_playlist(url: str, cookies: str, request: Request):
+    logger.debug(f"Received playlist request: url={url}, cookies={cookies}, headers={request.headers}")
     try:
+        # Normalize cookies
         cookies = urllib.parse.unquote(cookies).replace("%3B+", "; ").replace("%3D", "=")
         cookies = "; ".join(
             f"{pair.split('=')[0].lstrip('_')}={pair.split('=')[1]}"
@@ -123,15 +142,18 @@ async def get_playlist(url: str, cookies: str):
         )
         logger.debug(f"Normalized cookies: {cookies}")
 
+        # Try provided M3U8 URL
         result = await fetch_resource(url, cookies)
         if not result:
             logger.info("Provided M3U8 failed, fetching fresh URL and cookies")
             m3u8_url = await fetch_m3u8_url()
             cookies = await fetch_cookies()
             if not m3u8_url or not cookies:
+                logger.error("Could not fetch M3U8 URL or cookies")
                 raise HTTPException(status_code=500, detail="Could not fetch M3U8 URL or cookies")
             result = await fetch_resource(m3u8_url, cookies)
             if not result:
+                logger.error("Error fetching M3U8")
                 raise HTTPException(status_code=500, detail="Error fetching M3U8")
 
         m3u8_content, _ = result
@@ -179,7 +201,7 @@ async def get_playlist(url: str, cookies: str):
 
 @app.get("/{path:path}")
 async def get_resource(path: str, request: Request):
-    logger.debug(f"Request for resource: {path}")
+    logger.debug(f"Received resource request: path={path}, query={request.query_params}, headers={request.headers}")
     try:
         cookies = request.query_params.get("cookies", "")
         resource_url = SEGMENT_MAP.get(path)
